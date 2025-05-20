@@ -321,15 +321,45 @@ module Imap
     end
 
     def can_connect_to_imap?
-      # Example: (Adapt from your original service, especially reauthorization logic)
-      if @inbox.imap_reauthorization_needed?
-        # Your original service might have logic to disable the channel after too many errors.
-        # @inbox.disable_imap! if @inbox.imap_consecutive_auth_errors >= ::Channel::ImapChannel::MAX_CONSECUTIVE_AUTH_ERRORS_BEFORE_DISABLE
-        Rails.logger.warn "[IMAP ALIYUN] IMAP reauthorization needed for inbox #{@inbox.id}. Skipping fetch."
-        # Potentially send a notification or create a conversation about reauthorization.
+      # 确保通道已启用 IMAP
+      unless @channel.imap_enabled?
+        Rails.logger.warn "[AliyunService CONNECT_CHECK] IMAP not enabled for Channel ID: #{@channel.id}, Inbox ID: #{@inbox.id}"
         return false
       end
-      true
+
+      # 移除了对 @inbox.imap_reauthorization_needed? 的检查，因为它不适用于阿里云的密码认证
+      # 并且导致了 NoMethodError
+
+      # 尝试连接以验证凭据和服务器可达性
+      # 注意：这里只是为了检查是否能连接，实际的持久连接在 connect_and_login 中建立
+      temp_imap = nil
+      begin
+        Rails.logger.info "[AliyunService CONNECT_CHECK] Attempting temporary connection to #{@channel.imap_address} for Channel ID: #{@channel.id}"
+        temp_imap = Net::IMAP.new(@channel.imap_address, port: @channel.imap_port, ssl: ssl_options_for_channel)
+        temp_imap.authenticate('LOGIN', @channel.imap_login, @channel.imap_password) # 使用 LOGIN，因为阿里云通常是这个
+        Rails.logger.info "[AliyunService CONNECT_CHECK] Temporary connection and authentication successful for Channel ID: #{@channel.id}"
+        return true
+      rescue Net::IMAP::NoResponseError, Net::IMAP::ByeResponseError, Net::IMAP::BadResponseError, SocketError, Errno::ECONNREFUSED, Errno::ETIMEDOUT, OpenSSL::SSL::SSLError => e
+        error_message = "[AliyunService CONNECT_CHECK ERROR] Failed to connect/authenticate to IMAP server for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        # 可以考虑根据错误类型决定是否需要通知或禁用渠道
+        # 例如，对于认证失败，可以记录特定信息
+        if e.is_a?(Net::IMAP::NoResponseError) && e.message.match(/AUTHENTICATIONFAILED/i)
+          Rails.logger.warn "[AliyunService CONNECT_CHECK] Authentication failed for Channel ID: #{@channel.id}. Please check credentials."
+          # 根据您的业务逻辑，这里可以设置一个标记，提示用户检查凭证
+          # @channel.auth_error_notified_at = Time.now unless @channel.auth_error_notified_at? # 示例
+        end
+        return false
+      ensure
+        if temp_imap
+          begin
+            temp_imap.logout
+            temp_imap.disconnect
+          rescue StandardError => e_disconnect
+            Rails.logger.warn "[AliyunService CONNECT_CHECK] Error during temporary connection logout/disconnect: #{e_disconnect.message}"
+          end
+        end
+      end
     end
 
     def check_imap_reauthorization_status
