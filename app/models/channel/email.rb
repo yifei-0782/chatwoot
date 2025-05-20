@@ -8,6 +8,7 @@
 #  imap_address              :string           default("")
 #  imap_enable_ssl           :boolean          default(TRUE)
 #  imap_enabled              :boolean          default(FALSE)
+#  imap_last_uid             :string
 #  imap_login                :string           default("")
 #  imap_password             :string           default("")
 #  imap_port                 :integer          default(0)

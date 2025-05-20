@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.0].define(version: 2025_05_14_045638) do
+ActiveRecord::Schema[7.0].define(version: 2025_05_09_101318) do
   # These extensions should be enabled to support this database
   enable_extension "pg_stat_statements"
   enable_extension "pg_trgm"
@@ -362,6 +362,7 @@ ActiveRecord::Schema[7.0].define(version: 2025_05_14_045638) do
     t.boolean "smtp_enable_ssl_tls", default: false
     t.jsonb "provider_config", default: {}
     t.string "provider"
+    t.string "imap_last_uid"
     t.index ["email"], name: "index_channel_email_on_email", unique: true
     t.index ["forward_to_email"], name: "index_channel_email_on_forward_to_email", unique: true
   end
