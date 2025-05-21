@@ -1,195 +1,131 @@
 # frozen_string_literal: true
 
+# Service to fetch emails from Aliyun (or other generic IMAP servers not using OAuth2)
+# This service uses direct Net::IMAP for connection and fetching.
+# It's designed to be more resilient to servers that might have quirks
+# with UID SEARCH ranges or other IMAP commands.
+
 module Imap
-  # This service is a specialized version for Aliyun Enterprise Email,
-  # primarily to force the use of the IMAP LOGIN command.
-  #
-  # !!! IMPORTANT !!!
-  # This file is a TEMPLATE. You MUST:
-  # 1. COPY the entire content of your existing `app/services/imap/fetch_email_service.rb` into this file.
-  # 2. RENAME the class from `FetchEmailService` to `AliyunFetchEmailService`.
-  # 3. CAREFULLY MERGE the Aliyun-specific login logic (mainly `connect_and_login_to_aliyun`
-  #    and the usage of `@imap_connection` as a direct Net::IMAP instance)
-  #    into the copied code, ensuring all other functionalities (email fetching,
-  #    processing, error handling, etc.) from your original service are preserved and adapted.
-  #
-  class AliyunFetchEmailService < ::Imap::BaseFetchEmailService # Adjust base class if different or non-existent in your project
-    attr_reader :channel, :interval, :inbox, :imap_connection, :processed_mail_count, :current_max_uid
+  class AliyunFetchEmailService < BaseFetchEmailService
+    # Constants
+    MAX_EMAILS_PER_FETCH_CYCLE_FOR_TEST = 5 # For testing, limit emails processed in one go. Set to nil or 0 for no limit in prod.
+    UID_SEARCH_RANGE_SIZE = 200 # How many UIDs to search in a single UID SEARCH command if not using 'ALL'
 
-    # Standard initialize method.
-    def initialize(channel:, interval: nil)
-      # 将 channel 和 interval 都传递给 BaseFetchEmailService 的 initialize 方法
-      # BaseFetchEmailService 中的 pattr_initialize [:channel!, :interval] 意味着
-      # 其 initialize 方法期望这两个参数。
-      super(channel: channel, interval: interval)
+    attr_reader :channel, :inbox, :imap_connection, :current_max_uid, :processed_mail_count, :new_max_uid_this_run
 
-      # 执行 super(...) 后, @channel 和 @interval 实例变量已经被父类设置。
-      # 如果阿里云服务需要一个特定的默认 interval 值 (例如，如果父类将其设置为 nil，
-      # 而阿里云服务总是需要至少为 1), 我们可以在这里调整。
-      @interval ||= 1 # 确保 @interval 在父类设置后，如果为 nil，则默认为 1
-
-      # @channel 已由父类设置。
-      # @inbox 可以从 @channel派生。
-      @inbox = @channel.inbox
-
-      @processed_mail_count = 0
-      # @current_max_uid 将在 final_check_channel_object 中初始化
-
-      # 阿里云特定的初始化日志
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @channel class: #{@channel.class}, ID: #{@channel.id}"
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @interval (after super and default): #{@interval}" # 记录最终的 interval 值
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @channel responds to imap_address?: #{@channel.respond_to?(:imap_address)}"
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @channel responds to email?: #{@channel.respond_to?(:email)}"
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @channel responds to imap_password?: #{@channel.respond_to?(:imap_password)}"
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @channel responds to imap_last_uid?: #{@channel.respond_to?(:imap_last_uid)}"
-      Rails.logger.info "[AliyunService INIT ATTR-POST] @inbox class: #{@inbox.class}, ID: #{@inbox.id}" if @inbox
-
-      final_check_channel_object # 此方法检查必要属性并设置 @current_max_uid
-
+    def initialize(channel:, inbox: nil, imap_config: nil)
+      super(channel: channel) # Pass channel to BaseFetchEmailService if it expects it
+      @channel = channel
+      @inbox = channel.inbox # Assuming channel has_one inbox or similar
       @imap_connection = nil
+      @processed_mail_count = 0
+      @new_max_uid_this_run = 0
+      @limit_for_test = imap_config&.fetch(:limit_for_test, nil) # 从配置中读取，如果提供
+
+      @mailbox_selected = false # 新增: 邮箱是否成功选择的标志
+      @mailbox_uidnext = nil    # 新增: 存储邮箱的 UIDNEXT 值
+
+      final_check_channel_object # 确保 channel 和 inbox 对象有效
     end
 
-    # The main perform method. COPY AND ADAPT its structure from your FetchEmailService.
-    # The key difference will be how `@imap_connection` is established and used.
+    # The main perform method.
     def perform
       Rails.logger.info "[AliyunService PERFORM START] Attempting to fetch emails for Channel ID: #{@channel.id}, Inbox ID: #{@inbox.id}"
       @processed_mail_count = 0
       @new_max_uid_this_run = @current_max_uid # Initialize with current_max_uid
 
-      Rails.logger.info "[AliyunService INIT] Channel ID: #{@channel.id} responds to imap_last_uid. Value: \"#{@channel.imap_last_uid}\", Parsed @current_max_uid: #{@current_max_uid}"
+      # This log was part of final_check_channel_object, but good to have context here too.
+      Rails.logger.info "[AliyunService INIT] Channel ID: #{@channel.id}. Initial @current_max_uid from channel: #{@current_max_uid}"
 
       unless ensure_imap_enabled? && can_connect_to_imap?
         Rails.logger.warn "[AliyunService PERFORM] IMAP not enabled or cannot connect for Channel ID: #{@channel.id}. Aborting."
         return []
       end
 
-      connect_and_login
-      select_inbox
+      unless connect_and_login_to_aliyun
+        Rails.logger.error "[AliyunService PERFORM] Failed to establish persistent IMAP connection for Channel ID: #{@channel.id}. Aborting."
+        return []
+      end
 
-      new_uids = fetch_new_email_uids
+      unless select_mailbox('INBOX')
+        Rails.logger.error "[AliyunService PERFORM] Failed to select inbox for Channel ID: #{@channel.id}. Aborting."
+        return []
+      end
+
+      new_uids = fetch_new_email_uids(limit_for_test: MAX_EMAILS_PER_FETCH_CYCLE_FOR_TEST)
       if new_uids.empty?
         Rails.logger.info "[AliyunService PERFORM] No new UIDs to process for Channel ID: #{@channel.id}."
-        # 修改日志文本以反映返回类型
         Rails.logger.info "[AliyunService PERFORM END] Processed #{@processed_mail_count} emails for Channel ID: #{@channel.id}. New max UID for run: #{@new_max_uid_this_run}. Returning 0 Mail::Message objects."
         return []
       end
 
       Rails.logger.info "[AliyunService PERFORM] Found #{new_uids.count} new UIDs to process: #{new_uids.inspect} for Channel ID: #{@channel.id}."
-      # 修改：现在期望 process_email_uids 返回 Mail::Message 对象数组
       mail_messages = process_email_uids(new_uids)
 
-      # 修改日志文本以反映返回类型
       Rails.logger.info "[AliyunService PERFORM END] Processed #{@processed_mail_count} emails for Channel ID: #{@channel.id}. New max UID for run: #{@new_max_uid_this_run}. Returning #{mail_messages.count} Mail::Message objects."
       mail_messages
-    rescue Net::IMAP::NoResponseError, Net::IMAP::ByeResponseError, SocketError, Errno::ECONNREFUSED, Errno::ETIMEDOUT, OpenSSL::SSL::SSLError => e
-      Rails.logger.error "[AliyunService PERFORM ERROR] IMAP connection/command error for Channel ID #{@channel.id}: #{e.class} - #{e.message}"
-      @channel.authorization_error! if @channel.respond_to?(:authorization_error!)
-      return []
     rescue StandardError => e
-      Rails.logger.error "[AliyunService PERFORM ERROR] Unexpected error for Channel ID #{@channel.id}: #{e.class} - #{e.message}\n#{e.backtrace.join("\n")}"
-      @channel.authorization_error! if @channel.respond_to?(:authorization_error!)
-      return []
+      # ... existing rescue code ...
+      # return [] # Ensure this is present if you want to return from rescue
     ensure
+      Rails.logger.error "!!!!!!!!!! [AliyunService DEBUG ENSURE BLOCK ENTERED] Channel ID: #{@channel.id} !!!!!!!!!!" # 新增的强制日志
+      Rails.logger.info "[AliyunService PERFORM ENSURE] Entering ensure block for Channel ID: #{@channel.id}"
+      update_channel_last_uid
       disconnect_from_aliyun
-      Rails.logger.info "[AliyunService PERFORM ENSURE] Ensure block executed for Channel ID: #{@channel.id}."
-    end
-
-    private
-
-    # --- Helper for combined connection and inbox selection ---
-    def connect_and_select_inbox
-      Rails.logger.info "[AliyunService CONNECT_SELECT_INBOX] Attempting to connect and select inbox for Channel ID: #{@channel.id}"
-      connect_and_login_to_aliyun # This method logs and raises on failure
-      select_inbox_folder         # This method logs and raises on failure
-      Rails.logger.info "[AliyunService CONNECT_SELECT_INBOX] Successfully connected and selected inbox for Channel ID: #{@channel.id}"
-      true # Indicates success
-    rescue StandardError => e
-      # The individual methods (connect_and_login_to_aliyun, select_inbox_folder)
-      # already log their specific errors before raising them.
-      # We log a general failure message here for the combined operation.
-      Rails.logger.error "[AliyunService CONNECT_SELECT_INBOX_ERROR] Failed during connect/select for Channel ID #{@channel.id}: #{e.class} - #{e.message}"
-
-      # Attempt to disconnect if connection might have been established before the error.
-      disconnect_from_aliyun
-
-      # Signal failure to the perform method, so it can return early.
-      # The perform method's main rescue blocks will not be hit for this specific failure path
-      # because we are returning false, and perform will exit via "return unless connect_and_select_inbox".
-      false
-    end
-
-    # --- Connection and Login (Aliyun Specific) ---
-    def connect_and_login_to_aliyun
-      # 使用 @channel.email 作为 IMAP 登录名
-      imap_user = @channel.email
-      imap_pass = @channel.imap_password # 假设密码字段是 imap_password
-
-      Rails.logger.info "[AliyunService CONNECT] Connecting to Aliyun IMAP: #{@channel.imap_address}:#{@channel.imap_port.to_i}, SSL: #{@channel.imap_enable_ssl}"
-      @imap_connection = Net::IMAP.new(@channel.imap_address, port: @channel.imap_port.to_i, ssl: @channel.imap_enable_ssl)
-      Rails.logger.info "[AliyunService CONNECT] Connection established. Attempting login for user: #{imap_user}"
-      # 注意：Net::IMAP#login 通常期望的是用户名和密码，而不是整个 channel 对象
-      @imap_connection.login(imap_user, imap_pass)
-      Rails.logger.info "[AliyunService CONNECT] Login successful for user: #{imap_user}"
-    rescue Net::IMAP::NoResponseError => e
-      Rails.logger.error "[AliyunService CONNECT ERROR] Login failed for #{imap_user}: #{e.message}. Check credentials or IMAP settings."
-      raise
-    rescue StandardError => e
-      Rails.logger.error "[AliyunService CONNECT ERROR] Unexpected error during connect/login for #{imap_user}: #{e.class} - #{e.message}"
-      raise
+      log_email_processing_summary
+      Rails.logger.info "[AliyunService PERFORM END] Finished email fetch for Channel ID: #{@channel.id}"
     end
 
     def disconnect_from_aliyun
-      if @imap_connection && !@imap_connection.disconnected?
+      if @imap_connection && @imap_connection.respond_to?(:disconnected?) && !@imap_connection.disconnected?
         Rails.logger.info "[AliyunService DISCONNECT] Logging out and disconnecting from Aliyun IMAP."
         @imap_connection.logout
         @imap_connection.disconnect
-        Rails.logger.info "[AliyunService DISCONNECT] Disconnected."
       else
-        Rails.logger.info "[AliyunService DISCONNECT] No active IMAP connection to disconnect or already disconnected."
+        Rails.logger.info "[AliyunService DISCONNECT] No active IMAP connection to disconnect, or connection does not support disconnected? check."
       end
-    rescue Net::IMAP::NoResponseError, StandardError => e
+    rescue Net::IMAP::Error, StandardError => e
       Rails.logger.warn "[AliyunService DISCONNECT WARN] Error during IMAP logout/disconnect: #{e.class} - #{e.message}"
     ensure
-      @imap_connection = nil
+      @imap_connection = nil # Always set to nil
     end
 
-    # --- IMAP Operations (Must use @imap_connection directly) ---
-    # COPY AND ADAPT the following methods from your FetchEmailService.
-    # Ensure they use `@imap_connection.select`, `@imap_connection.uid_search`, etc.
-
-    def select_inbox_folder
-      target_folder = 'INBOX'
-      Rails.logger.info "[AliyunService SELECT_INBOX] Selecting IMAP folder: #{target_folder}."
-      response = @imap_connection.select(target_folder)
-      Rails.logger.info "[AliyunService SELECT_INBOX] Folder #{target_folder} selected. Response: #{response.inspect}"
-    rescue Net::IMAP::NoResponseError => e
-      Rails.logger.error "[AliyunService SELECT_INBOX ERROR] Could not select folder #{target_folder}: #{e.message}"
-      raise
-    rescue StandardError => e
-      Rails.logger.error "[AliyunService SELECT_INBOX ERROR] Unexpected error selecting folder #{target_folder}: #{e.class} - #{e.message}"
-      raise
-    end
-
+    # Fetches new email UIDs from the server.
+    # It starts searching from @current_max_uid + 1.
+    # Handles potential issues with UID SEARCH ranges by falling back to 'ALL' if necessary.
     def fetch_new_email_uids(limit_for_test: nil)
-      uid_range_string = "#{@current_max_uid + 1}:*"
-      search_keys_range = [uid_range_string]
+      unless @imap_connection && @imap_connection.respond_to?(:disconnected?) && !@imap_connection.disconnected?
+        Rails.logger.error "[AliyunService FETCH_UIDS] No active IMAP connection to fetch UIDs."
+        return []
+      end
+
+      # Determine the starting UID for the search
+      start_uid = @current_max_uid + 1
+      search_keys_range = ["UID", "#{start_uid}:*"] # Search for UIDs from start_uid to the highest
+
       uids_found = []
-
-      Rails.logger.info "[AliyunService FETCH_UIDS] Attempting UID SEARCH with range keys: #{search_keys_range.inspect}"
       begin
-        uids_found = @imap_connection.uid_search(search_keys_range)
-        if uids_found.nil?
-          Rails.logger.warn "[AliyunService FETCH_UIDS] UID_SEARCH with range '#{search_keys_range.inspect}' returned nil. Assuming no new emails."
-          uids_found = [] # Ensure it's an array
-        else
-          Rails.logger.info "[AliyunService FETCH_UIDS] UID_SEARCH with range '#{search_keys_range.inspect}' found #{uids_found.count} UIDs: #{uids_found.inspect}"
-        end
-      rescue Net::IMAP::BadResponseError => e
-        Rails.logger.warn "[AliyunService FETCH_UIDS WARN] UID_SEARCH with range '#{search_keys_range.inspect}' failed: #{e.message}. Falling back to UID SEARCH ALL."
+        Rails.logger.info "[AliyunService FETCH_UIDS] Attempting UID_SEARCH with keys: #{search_keys_range.inspect}"
+        uids_from_range = @imap_connection.uid_search(search_keys_range)
 
+        if uids_from_range.nil?
+          # This can happen on some servers if the range returns no results, or if there's an issue.
+          Rails.logger.warn "[AliyunService FETCH_UIDS] UID_SEARCH with range #{search_keys_range.inspect} returned nil. This might be normal if no new emails, or an issue."
+          # To be safe, or if this indicates an issue with range search, consider fallback.
+          # For now, assume it means no UIDs in range.
+          uids_found = []
+        else
+          Rails.logger.info "[AliyunService FETCH_UIDS] UID_SEARCH with range found #{uids_from_range.count} UIDs: #{uids_from_range.inspect}"
+          uids_found = uids_from_range
+        end
+
+      rescue Net::IMAP::BadResponseError, Net::IMAP::NoResponseError => e
+        Rails.logger.warn "[AliyunService FETCH_UIDS WARNING] UID_SEARCH with range #{search_keys_range.inspect} failed: #{e.class} - #{e.message}. Attempting fallback to 'ALL'."
+        # Fallback strategy: Search for 'ALL' UIDs and then filter them.
+        # This is less efficient but more robust if range searches are problematic.
         begin
           search_keys_all = ['ALL']
-          Rails.logger.info "[AliyunService FETCH_UIDS] Attempting UID SEARCH with keys: #{search_keys_all.inspect} as fallback."
+          Rails.logger.info "[AliyunService FETCH_UIDS] Fallback: Attempting UID_SEARCH with keys: #{search_keys_all.inspect}"
           uids_from_all = @imap_connection.uid_search(search_keys_all)
 
           if uids_from_all.nil?
@@ -232,8 +168,7 @@ module Imap
 
     def process_email_uids(uids)
       processed_info = []
-      # 修改：现在收集 Mail::Message 对象
-      successfully_parsed_mails = []
+      successfully_parsed_mails = [] # Now collects Mail::Message objects
       return successfully_parsed_mails if uids.empty?
 
       uids_to_fetch_full_data = uids
@@ -250,7 +185,7 @@ module Imap
         end
 
         rfc822_data = fetch_data_array[0].attr['RFC822']
-        internal_date_str = fetch_data_array[0].attr['INTERNALDATE'] # 保留以备将来使用或记录
+        internal_date_str = fetch_data_array[0].attr['INTERNALDATE'] # Keep for future use or logging
 
         if rfc822_data.blank?
           Rails.logger.warn "[AliyunService PROCESS_UIDS] RFC822 data is blank for UID: #{uid}."
@@ -262,14 +197,8 @@ module Imap
 
         begin
           mail_object = ::Mail.read_from_string(rfc822_data)
-
-          # 移除了 @inbox.is_a?(::Inbox) 检查，因为我们不再直接创建依赖 @inbox 的记录
-          # 移除了 source_id 和重复检查逻辑，这些应该由 FetchImapEmailsJob 的 process_mail 处理
-
-          # 修改：不再创建 InboundEmail，而是收集 mail_object
           successfully_parsed_mails << mail_object
 
-          # 更新 processed_info 和计数器
           processed_info << { uid: uid, status: :parsed_successfully, message_id: mail_object.message_id }
           @processed_mail_count += 1
           @new_max_uid_this_run = uid.to_i if uid.to_i > @new_max_uid_this_run
@@ -282,35 +211,36 @@ module Imap
       end
 
       Rails.logger.info "[AliyunService PROCESS_UIDS] Finished processing UIDs. Processed info: #{processed_info.inspect}. Returning #{successfully_parsed_mails.count} Mail::Message objects."
-      # 修改：返回 Mail::Message 对象数组
       successfully_parsed_mails
     end
 
     def update_channel_last_uid
-      # Check if the channel object can persist imap_last_uid
-      can_persist_uid = @channel.respond_to?(:imap_last_uid=) && @channel.respond_to?(:imap_last_uid)
+      initial_uid_for_run = @current_max_uid
+      highest_uid_this_run = @new_max_uid_this_run
 
-      if can_persist_uid
-        current_persisted_uid = @channel.imap_last_uid.to_i
-        if @new_max_uid_this_run > current_persisted_uid
-          Rails.logger.info "[AliyunService UPDATE_UID] Attempting to update imap_last_uid for channel #{@channel.id} from #{current_persisted_uid} to #{@new_max_uid_this_run}"
-          if @channel.update(imap_last_uid: @new_max_uid_this_run.to_s)
-             Rails.logger.info "[AliyunService UPDATE_UID] Successfully updated imap_last_uid for channel #{@channel.id} to #{@new_max_uid_this_run}"
-          else
-             Rails.logger.error "[AliyunService UPDATE_UID] Failed to update imap_last_uid for channel #{@channel.id}. Errors: #{@channel.errors.full_messages.join(', ')}"
-          end
+      # 新增调试日志
+      Rails.logger.error "!!!!!!!!!! [AliyunService DEBUG UPDATE_UID_START] initial_uid: #{initial_uid_for_run}, highest_uid_this_run: #{highest_uid_this_run} !!!!!!!!!!"
+
+      Rails.logger.info "[AliyunService UPDATE_UID] Attempting to update UID. Initial for run: #{initial_uid_for_run}, Highest this run: #{highest_uid_this_run}, Channel ID: #{@channel.id}"
+
+      if highest_uid_this_run.to_i > initial_uid_for_run.to_i # 确保比较的是整数
+        Rails.logger.info "[AliyunService UPDATE_UID] Updating channel #{@channel.id} imap_last_uid from #{initial_uid_for_run} to #{highest_uid_this_run}"
+        if @channel.update(imap_last_uid: highest_uid_this_run)
+          Rails.logger.info "[AliyunService UPDATE_UID] Successfully updated imap_last_uid for channel #{@channel.id} to #{highest_uid_this_run}"
         else
-          Rails.logger.info "[AliyunService UPDATE_UID] No new highest UID to update for channel #{@channel.id}. Current persisted: #{current_persisted_uid}, Max fetched this run: #{@new_max_uid_this_run}"
+          Rails.logger.error "[AliyunService UPDATE_UID] Failed to update imap_last_uid for channel #{@channel.id}. Errors: #{@channel.errors.full_messages.join(', ')}"
         end
       else
-        Rails.logger.warn "[AliyunService UPDATE_UID WARN] Channel #{@channel.id} does not support persisting imap_last_uid (missing imap_last_uid= or imap_last_uid method). UID will not be saved."
+        Rails.logger.info "[AliyunService UPDATE_UID] No update needed for imap_last_uid. Current persisted (at start of run): #{initial_uid_for_run}, new_max_uid_this_run: #{highest_uid_this_run}. Channel ID: #{@channel.id}"
       end
+    rescue StandardError => e
+      Rails.logger.error "[AliyunService UPDATE_UID ERROR] Unexpected error during imap_last_uid update for channel #{@channel.id}: #{e.class} - #{e.message}\n#{e.backtrace.join("\n")}"
+      # 为了调试，也记录一下当时的 UID 值
+      Rails.logger.error "!!!!!!!!!! [AliyunService DEBUG UPDATE_UID_EXCEPTION_VALUES] initial_uid: #{initial_uid_for_run}, highest_uid_this_run: #{highest_uid_this_run} !!!!!!!!!!"
     end
 
     # --- Helper and Error Handling Methods ---
-    # COPY AND ADAPT ALL relevant helper and error handling methods from your
-    # FetchEmailService and/or its BaseFetchEmailService.
-    # Ensure they are compatible with the changes made (e.g., direct Net::IMAP usage).
+    private
 
     def ensure_imap_enabled?
       unless @channel.respond_to?(:imap_enabled?) && @channel.imap_enabled?
@@ -321,34 +251,33 @@ module Imap
     end
 
     def can_connect_to_imap?
-      # 确保通道已启用 IMAP
       unless @channel.imap_enabled?
         Rails.logger.warn "[AliyunService CONNECT_CHECK] IMAP not enabled for Channel ID: #{@channel.id}, Inbox ID: #{@inbox.id}"
         return false
       end
 
-      # 移除了对 @inbox.imap_reauthorization_needed? 的检查，因为它不适用于阿里云的密码认证
-      # 并且导致了 NoMethodError
-
-      # 尝试连接以验证凭据和服务器可达性
-      # 注意：这里只是为了检查是否能连接，实际的持久连接在 connect_and_login 中建立
       temp_imap = nil
       begin
         Rails.logger.info "[AliyunService CONNECT_CHECK] Attempting temporary connection to #{@channel.imap_address} for Channel ID: #{@channel.id}"
-        temp_imap = Net::IMAP.new(@channel.imap_address, port: @channel.imap_port, ssl: ssl_options_for_channel)
-        temp_imap.authenticate('LOGIN', @channel.imap_login, @channel.imap_password) # 使用 LOGIN，因为阿里云通常是这个
+        temp_imap = Net::IMAP.new(@channel.imap_address, port: @channel.imap_port.to_i, ssl: ssl_options_for_channel)
+        temp_imap.login(@channel.imap_login, @channel.imap_password)
         Rails.logger.info "[AliyunService CONNECT_CHECK] Temporary connection and authentication successful for Channel ID: #{@channel.id}"
         return true
-      rescue Net::IMAP::NoResponseError, Net::IMAP::ByeResponseError, Net::IMAP::BadResponseError, SocketError, Errno::ECONNREFUSED, Errno::ETIMEDOUT, OpenSSL::SSL::SSLError => e
-        error_message = "[AliyunService CONNECT_CHECK ERROR] Failed to connect/authenticate to IMAP server for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+      rescue Net::IMAP::NoResponseError, Net::IMAP::ByeResponseError, Net::IMAP::BadResponseError => e
+        error_message = "[AliyunService CONNECT_CHECK ERROR] IMAP operational error for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
         Rails.logger.error error_message
-        # 可以考虑根据错误类型决定是否需要通知或禁用渠道
-        # 例如，对于认证失败，可以记录特定信息
-        if e.is_a?(Net::IMAP::NoResponseError) && e.message.match(/AUTHENTICATIONFAILED/i)
-          Rails.logger.warn "[AliyunService CONNECT_CHECK] Authentication failed for Channel ID: #{@channel.id}. Please check credentials."
-          # 根据您的业务逻辑，这里可以设置一个标记，提示用户检查凭证
-          # @channel.auth_error_notified_at = Time.now unless @channel.auth_error_notified_at? # 示例
+        if e.is_a?(Net::IMAP::BadResponseError) || (e.is_a?(Net::IMAP::NoResponseError) && e.message.match?(/AUTHENTICATIONFAILED/i))
+          Rails.logger.warn "[AliyunService CONNECT_CHECK] Authentication failed for Channel ID: #{@channel.id}. Please check credentials or server IMAP settings for LOGIN command."
         end
+        return false
+      rescue SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH, Timeout::Error, OpenSSL::SSL::SSLError => e
+        error_message = "[AliyunService CONNECT_CHECK ERROR] Network or SSL error for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        return false
+      rescue StandardError => e
+        error_message = "[AliyunService CONNECT_CHECK ERROR] Unexpected error during connection check for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        ::Sentry.capture_exception(e, extra: { channel_id: @channel.id, service: 'AliyunFetchEmailService', context: 'can_connect_to_imap_unexpected' }) if defined?(::Sentry)
         return false
       ensure
         if temp_imap
@@ -362,90 +291,170 @@ module Imap
       end
     end
 
-    def check_imap_reauthorization_status
-      # Example: (Adapt from your original service)
-      # This might be called after a login failure.
-      if @inbox.imap_consecutive_auth_errors >= ::Channel::ImapChannel::MAX_CONSECUTIVE_AUTH_ERRORS_BEFORE_REAUTH_FLAG
-        @inbox.set_imap_reauthorization_needed! # Ensure this method exists on your channel/inbox model
-        Rails.logger.warn "[IMAP ALIYUN] Inbox #{@inbox.id} marked as needing IMAP reauthorization due to consecutive auth errors."
+    def connect_and_login_to_aliyun
+      if @imap_connection && @imap_connection.respond_to?(:disconnected?) && !@imap_connection.disconnected?
+        Rails.logger.info "[AliyunService CONNECT_PERSISTENT] Using existing active IMAP connection (checked via !disconnected?)."
+        return true
+      end
+
+      begin
+        Rails.logger.info "[AliyunService CONNECT_PERSISTENT] Attempting persistent connection to #{@channel.imap_address} for Channel ID: #{@channel.id}"
+        @imap_connection = Net::IMAP.new(@channel.imap_address, port: @channel.imap_port.to_i, ssl: ssl_options_for_channel)
+        @imap_connection.login(@channel.imap_login, @channel.imap_password)
+        Rails.logger.info "[AliyunService CONNECT_PERSISTENT] Persistent connection and authentication successful for Channel ID: #{@channel.id}"
+        return true
+      rescue Net::IMAP::NoResponseError, Net::IMAP::ByeResponseError, Net::IMAP::BadResponseError => e
+        error_message = "[AliyunService CONNECT_PERSISTENT ERROR] IMAP operational error for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        if e.is_a?(Net::IMAP::BadResponseError) || (e.is_a?(Net::IMAP::NoResponseError) && e.message.match?(/AUTHENTICATIONFAILED/i))
+          Rails.logger.warn "[AliyunService CONNECT_PERSISTENT] Authentication failed for Channel ID: #{@channel.id}. Please check credentials."
+        end
+        @imap_connection = nil
+        return false
+      rescue SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH, Timeout::Error, OpenSSL::SSL::SSLError => e
+        error_message = "[AliyunService CONNECT_PERSISTENT ERROR] Network or SSL error for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        @imap_connection = nil
+        return false
+      rescue StandardError => e
+        error_message = "[AliyunService CONNECT_PERSISTENT ERROR] Unexpected error during persistent connection for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        Rails.logger.error error_message
+        ::Sentry.capture_exception(e, extra: { channel_id: @channel.id, service: 'AliyunFetchEmailService', context: 'connect_and_login_to_aliyun_unexpected' }) if defined?(::Sentry)
+        @imap_connection = nil
+        return false
       end
     end
 
-    def handle_imap_bye_error(exception)
-      # Example: (Adapt from your original service)
-      Rails.logger.error "[IMAP ALIYUN] IMAP BYE response for channel #{@channel.id}: #{exception.message}. Server may have disconnected."
-      # Consider incrementing a specific error counter or notifying.
+    def ssl_options_for_channel
+      return false unless @channel.imap_enable_ssl
+      true # Default: use SSL with default options. Can be { verify_mode: OpenSSL::SSL::VERIFY_NONE } if needed.
     end
 
-    def handle_ssl_error(exception)
-      # Example: (Adapt from your original service)
-      Rails.logger.error "[IMAP ALIYUN] SSL Error for channel #{@channel.id}: #{exception.message}"
-      # Mark channel as having an error, potentially notify admin.
-      # @channel.set_imap_error_status!('SSL Error') # Example
-    end
+    def select_mailbox(mailbox_name)
+      @mailbox_selected = false # 重置状态
+      @mailbox_uidnext = nil    # 重置状态
 
-    def handle_imap_connection_error(exception)
-      # Example: (Adapt from your original service)
-      Rails.logger.error "[IMAP ALIYUN] IMAP Connection Error for channel #{@channel.id}: #{exception.class} - #{exception.message}"
-      # Mark channel as having an error.
-      # @channel.set_imap_error_status!('Connection Error') # Example
-    end
+      # --- BEGIN DEBUG LOGGING ---
+      if @imap_connection
+        Rails.logger.info "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection object_id: #{@imap_connection.object_id}, class: #{@imap_connection.class}"
+        if @imap_connection.respond_to?(:connected?)
+          # Only call .connected? if it responds to it, to avoid error if method is missing
+          is_connected_val = @imap_connection.connected?
+          Rails.logger.info "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection.respond_to?(:connected?) is TRUE. @imap_connection.connected?: #{is_connected_val}"
+        else
+          Rails.logger.warn "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection.respond_to?(:connected?) is FALSE."
+        end
+        if @imap_connection.respond_to?(:disconnected?)
+          is_disconnected_val = @imap_connection.disconnected?
+          Rails.logger.info "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection.respond_to?(:disconnected?) is TRUE. @imap_connection.disconnected?: #{is_disconnected_val}"
+        else
+          Rails.logger.warn "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection.respond_to?(:disconnected?) is FALSE."
+        end
+      else
+        Rails.logger.warn "[AliyunService SELECT_MAILBOX_DEBUG] @imap_connection is nil."
+      end
+      # --- END DEBUG LOGGING ---
 
-    def handle_generic_imap_error(exception)
-      # Example: (Adapt from your original service)
-      error_message = "[IMAP ALIYUN] Generic Error during email fetch for channel #{@channel.id}: #{exception.class} - #{exception.message}"
-      Rails.logger.error "#{error_message}\n#{exception.backtrace.join("\n")}"
-      Sentry.capture_exception(exception, extra: { channel_id: @channel.id, inbox_id: @inbox.id }) if defined?(Sentry)
-      # @channel.set_imap_error_status!('Generic Error') # Example
+      unless @imap_connection && @imap_connection.respond_to?(:disconnected?) && !@imap_connection.disconnected?
+        Rails.logger.error "[AliyunService SELECT_MAILBOX] No active IMAP connection to select mailbox '#{mailbox_name}' (Checked via respond_to?(:disconnected?) and !disconnected?)."
+        return false
+      end
+
+      begin
+        Rails.logger.info "[AliyunService SELECT_MAILBOX] Attempting to select mailbox '#{mailbox_name}' for Channel ID: #{@channel.id}"
+        response = @imap_connection.select(mailbox_name)
+        if response # Net::IMAP#select returns a Net::IMAP::TaggedResponse on success
+          Rails.logger.info "[AliyunService SELECT_MAILBOX] Successfully selected mailbox '#{mailbox_name}'."
+          @mailbox_selected = true # 标记邮箱已选择
+
+          # 获取 UIDNEXT 状态
+          begin
+            status = @imap_connection.status(mailbox_name, ["UIDNEXT"])
+            if status && status["UIDNEXT"]
+              @mailbox_uidnext = status["UIDNEXT"].to_i
+              Rails.logger.info "[AliyunService SELECT_MAILBOX] Mailbox '#{mailbox_name}' status UIDNEXT: #{@mailbox_uidnext}"
+            else
+              Rails.logger.warn "[AliyunService SELECT_MAILBOX] Could not retrieve UIDNEXT for mailbox '#{mailbox_name}'."
+            end
+          rescue StandardError => e_status
+            Rails.logger.error "[AliyunService SELECT_MAILBOX ERROR] Error fetching status for UIDNEXT: #{e_status.message}"
+            # 即使获取 UIDNEXT 失败，select 本身是成功的，所以不改变 @mailbox_selected
+          end
+          return true
+        else
+          Rails.logger.error "[AliyunService SELECT_MAILBOX] Failed to select mailbox '#{mailbox_name}' (unexpected nil/false response from select)."
+          return false
+        end
+      rescue Net::IMAP::NoResponseError, Net::IMAP::BadResponseError => e
+        Rails.logger.error "[AliyunService SELECT_MAILBOX ERROR] Error selecting mailbox '#{mailbox_name}' for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        return false
+      rescue StandardError => e
+        Rails.logger.error "[AliyunService SELECT_MAILBOX ERROR] Unexpected error selecting mailbox '#{mailbox_name}' for Channel ID: #{@channel.id}. Error: #{e.class} - #{e.message}"
+        ::Sentry.capture_exception(e, extra: { channel_id: @channel.id, mailbox: mailbox_name, service: 'AliyunFetchEmailService', context: 'select_mailbox_unexpected' }) if defined?(::Sentry)
+        return false
+      end
     end
 
     def log_email_processing_summary
-      # Example: (Adapt from your original service)
-      Rails.logger.info "[IMAP ALIYUN] Finished email fetch for channel #{@channel.id}. Processed #{@processed_mail_count} emails. Last UID synced: #{@current_max_uid}."
+      Rails.logger.info "[AliyunService SUMMARY] Finished email fetch for channel #{@channel.id}. Processed #{@processed_mail_count} emails. Last UID synced this run: #{@new_max_uid_this_run} (was #{@current_max_uid} at start)."
     end
-
-    # Add any other private/protected helper methods from your original FetchEmailService here,
-    # ensuring they are adapted to use `@imap_connection` (Net::IMAP instance) correctly.
-    # For example, methods for:
-    # - Parsing email content (`create_inbound_mail_from_source`)
-    # - Handling attachments
-    # - Checking processing time limits
-    # - Specific logging or notification logic
 
     def final_check_channel_object
       missing_requirements = []
       missing_requirements << "channel object is nil" if @channel.nil?
-      missing_requirements << "inbox object is nil" if @inbox.nil?
+      missing_requirements << "inbox object is nil" if @inbox.nil? && @channel # Check inbox only if channel exists
 
       if @channel
-        missing_requirements << "channel does not respond to imap_address" unless @channel.respond_to?(:imap_address)
-        missing_requirements << "channel does not respond to email (for IMAP username)" unless @channel.respond_to?(:email)
-        missing_requirements << "channel does not respond to imap_password" unless @channel.respond_to?(:imap_password)
-        missing_requirements << "channel does not respond to imap_last_uid" unless @channel.respond_to?(:imap_last_uid)
+        [:imap_address, :imap_port, :imap_login, :imap_password, :imap_last_uid, :imap_enable_ssl, :imap_enabled?].each do |method_sym|
+          missing_requirements << "channel does not respond to #{method_sym}" unless @channel.respond_to?(method_sym)
+        end
       end
 
       unless missing_requirements.empty?
         error_message = "AliyunFetchEmailService: Channel object is not correctly initialized. Missing: #{missing_requirements.join(', ')}"
         Rails.logger.error "[AliyunService INIT FINAL-CHECK] CRITICAL: #{error_message}"
+        # Log details for easier debugging
         Rails.logger.error "[AliyunService INIT FINAL-CHECK] Channel nil?: #{@channel.nil?}"
         Rails.logger.error "[AliyunService INIT FINAL-CHECK] Inbox nil?: #{@inbox.nil?}"
         if @channel
           Rails.logger.error "[AliyunService INIT FINAL-CHECK] Responds to imap_address?: #{@channel.respond_to?(:imap_address)}"
-          Rails.logger.error "[AliyunService INIT FINAL-CHECK] Responds to email?: #{@channel.respond_to?(:email)}"
-          Rails.logger.error "[AliyunService INIT FINAL-CHECK] Responds to imap_password?: #{@channel.respond_to?(:imap_password)}"
-          Rails.logger.error "[AliyunService INIT FINAL-CHECK] Responds to imap_last_uid?: #{@channel.respond_to?(:imap_last_uid)}"
+          Rails.logger.error "[AliyunService INIT FINAL-CHECK] Responds to imap_login?: #{@channel.respond_to?(:imap_login)}"
+          # Add more checks if needed
         end
         raise ArgumentError, error_message
       end
 
       if @channel.respond_to?(:imap_last_uid) && @channel.imap_last_uid.present?
         @current_max_uid = @channel.imap_last_uid.to_i
-        Rails.logger.info "[AliyunService INIT] Channel ID: #{@channel.id} responds to imap_last_uid. Value: \"#{@channel.imap_last_uid}\", Parsed @current_max_uid: #{@current_max_uid}"
       else
-        @current_max_uid = 0
-        Rails.logger.info "[AliyunService INIT] Channel ID: #{@channel.id} does NOT respond to imap_last_uid or it's blank. Defaulting @current_max_uid to 0."
+        @current_max_uid = 0 # Default if not present or not supported
       end
+      Rails.logger.info "[AliyunService INIT FINAL-CHECK] Initialized with @current_max_uid: #{@current_max_uid} for Channel ID: #{@channel.id}"
     end
 
+    # Placeholder for other error handlers if needed, adapt from your BaseFetchEmailService or specific needs
+    def handle_imap_bye_error(exception)
+      Rails.logger.error "[IMAP ALIYUN] IMAP BYE response for channel #{@channel.id}: #{exception.message}. Server may have disconnected."
+    end
+
+    def handle_ssl_error(exception)
+      Rails.logger.error "[IMAP ALIYUN] SSL Error for channel #{@channel.id}: #{exception.message}"
+    end
+
+    def handle_imap_connection_error(exception)
+      Rails.logger.error "[IMAP ALIYUN] IMAP Connection Error for channel #{@channel.id}: #{exception.class} - #{exception.message}"
+    end
+
+    def handle_generic_imap_error(exception)
+      error_message = "[IMAP ALIYUN] Generic Error during email fetch for channel #{@channel.id}: #{exception.class} - #{exception.message}"
+      Rails.logger.error "#{error_message}\n#{exception.backtrace.join("\n")}"
+      ::Sentry.capture_exception(exception, extra: { channel_id: @channel.id, inbox_id: @inbox.id }) if defined?(::Sentry)
+    end
+
+    def log_summary
+      Rails.logger.info "[AliyunService SUMMARY] Channel ID: #{@channel.id}, Processed Mails: #{@processed_mail_count}, Initial Max UID: #{@current_max_uid}, New Max UID This Run: #{@new_max_uid_this_run}"
+      # 新增调试日志，看看 @new_max_uid_this_run 在这里的值
+      Rails.logger.error "!!!!!!!!!! [AliyunService DEBUG LOG_SUMMARY] @new_max_uid_this_run is: #{@new_max_uid_this_run} !!!!!!!!!!"
+    end
   end
 end

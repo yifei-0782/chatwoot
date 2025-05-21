@@ -54,7 +54,7 @@ class Inboxes::FetchImapEmailsJob < MutexApplicationJob
                        Imap::GoogleFetchEmailService.new(channel: channel, interval: interval).perform
                      elsif is_aliyun_host # 使用上面计算的布尔值
                        Rails.logger.info "[IMAP ROUTING] Routing to AliyunFetchEmailService for channel ID: #{channel.id}, Host: #{direct_imap_address}"
-                       Imap::AliyunFetchEmailService.new(channel: channel, interval: interval).perform
+                       Imap::AliyunFetchEmailService.new(channel: channel).perform
                      else
                        Rails.logger.info "[IMAP ROUTING] Routing to default FetchEmailService for channel ID: #{channel.id}. Host: #{direct_imap_address.inspect}"
                        Imap::FetchEmailService.new(channel: channel, interval: interval).perform
